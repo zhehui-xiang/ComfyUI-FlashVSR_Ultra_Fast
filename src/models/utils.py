@@ -187,19 +187,38 @@ def hash_state_dict_keys(state_dict, with_shape=True):
     keys_str = keys_str.encode(encoding="UTF-8")
     return hashlib.md5(keys_str).hexdigest()
 
-def clean_vram():
-    gc.collect()
+def empty_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
+
+def clean_vram():
+    gc.collect()
+    empty_cache()
+
+def get_auto_device():
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu:0"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "auto"
 
 def get_device_list():
     devs = ["auto"]
     try:
         if hasattr(torch, "cuda") and hasattr(torch.cuda, "is_available") and torch.cuda.is_available():
             devs += [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            devs += [f"xpu:{i}" for i in range(torch.xpu.device_count())]
     except Exception:
         pass
     try:

@@ -6,6 +6,7 @@ import math
 import torch
 import folder_paths
 import comfy.utils
+import comfy.model_management as mm
 
 import numpy as np
 import torch.nn.functional as F
@@ -14,7 +15,7 @@ from einops import rearrange
 from huggingface_hub import snapshot_download
 from .src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
 from .src.models.TCDecoder import build_tcdecoder
-from .src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
+from .src.models.utils import clean_vram, get_device_list, get_auto_device, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
 from .src.models import wan_video_dit
 
 device_choices = get_device_list()
@@ -32,11 +33,34 @@ def log(message:str, message_type:str='normal'):
         message = message
     print(f"{message}")
 
+def free_comfy_vram():
+    # FlashVSR moves its weights to the device by itself, bypassing ComfyUI model management,
+    # so models cached by ComfyUI (e.g. the video DiT / text encoder) must be unloaded first
+    mm.unload_all_models()
+    mm.soft_empty_cache()
+    clean_vram()
+
+def find_model_dir(model):
+    # ComfyUI/models first, then base paths from --extra-model-paths-config (parents of registered model folders)
+    roots = [folder_paths.models_dir]
+    for name in ("diffusion_models", "checkpoints", "vae", "loras"):
+        for path in folder_paths.get_folder_paths(name):
+            root = os.path.dirname(os.path.normpath(path))
+            if root not in roots:
+                roots.append(root)
+    for root in roots:
+        model_dir = os.path.join(root, model)
+        if os.path.isdir(model_dir):
+            return model_dir
+    return None
+
 def model_downlod(model_name="JunhaoZhuang/FlashVSR"):
-    model_dir = os.path.join(folder_paths.models_dir, model_name.split("/")[-1])
-    if not os.path.exists(model_dir):
+    model_dir = find_model_dir(model_name.split("/")[-1])
+    if model_dir is None:
+        model_dir = os.path.join(folder_paths.models_dir, model_name.split("/")[-1])
         log(f"Downloading model '{model_name}' from huggingface...", message_type='info')
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
+    return model_dir
 
 def tensor2video(frames: torch.Tensor):
     video_squeezed = frames.squeeze(0)
@@ -137,8 +161,7 @@ def create_feather_mask(size, overlap):
     return mask
 
 def init_pipeline(model, mode, device, dtype, alt_vae="none"):
-    model_downlod(model_name="JunhaoZhuang/"+model)
-    model_path = os.path.join(folder_paths.models_dir, model)
+    model_path = model_downlod(model_name="JunhaoZhuang/"+model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
     ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
@@ -161,18 +184,19 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
     current_dir = os.path.dirname(os.path.abspath(__file__))
     prompt_path = os.path.join(current_dir, "posi_prompt.pth")
     
-    mm = ModelManager(torch_dtype=dtype, device="cpu")
+    free_comfy_vram()
+    model_manager = ModelManager(torch_dtype=dtype, device="cpu")
     if mode == "full":
-        mm.load_models([ckpt_path, vae_path])
-        pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
+        model_manager.load_models([ckpt_path, vae_path])
+        pipe = FlashVSRFullPipeline.from_model_manager(model_manager, device=device)
         pipe.vae.model.encoder = None
         pipe.vae.model.conv1 = None
     else:
-        mm.load_models([ckpt_path])
+        model_manager.load_models([ckpt_path])
         if mode == "tiny":
-            pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=device)
+            pipe = FlashVSRTinyPipeline.from_model_manager(model_manager, device=device)
         else:
-            pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device)
+            pipe = FlashVSRTinyLongPipeline.from_model_manager(model_manager, device=device)
         multi_scale_channels = [512, 256, 128, 128]
         pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
         mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
@@ -243,6 +267,7 @@ class cqdm:
         return self.total
 
 def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload):
+    free_comfy_vram()
     _frames = frames
     _device = pipe.device
     dtype = pipe.torch_dtype
@@ -354,7 +379,7 @@ class FlashVSRNodeInitPipe:
                 }),
                 "device": (device_choices, {
                     "default": device_choices[0],
-                    "tooltip": "Device to load the weights, default: auto (CUDA if available, else CPU)"
+                    "tooltip": "Device to load the weights, default: auto (CUDA, then XPU, then MPS)"
                 }),
                 "attention_mode": (["sparse_sage_attention", "block_sparse_attention"], {
                     "default": "sparse_sage_attention",
@@ -372,12 +397,14 @@ class FlashVSRNodeInitPipe:
     def main(self, model, mode, alt_vae, force_offload, precision, device, attention_mode):
         _device = device
         if device == "auto":
-            _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
+            _device = get_auto_device()
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
             
         if _device.startswith("cuda"):
             torch.cuda.set_device(_device)
+        elif _device.startswith("xpu"):
+            torch.xpu.set_device(_device)
             
         if attention_mode == "sparse_sage_attention":
             wan_video_dit.USE_BLOCK_ATTN = False
@@ -532,7 +559,7 @@ class FlashVSRNode:
     
     def main(self, model, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed):
         wan_video_dit.USE_BLOCK_ATTN = False
-        _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
+        _device = get_auto_device()
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
             
