@@ -17,6 +17,7 @@ from .src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, Flash
 from .src.models.TCDecoder import build_tcdecoder
 from .src.models.utils import clean_vram, get_device_list, get_auto_device, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
 from .src.models import wan_video_dit
+from .multi_device import MultiDevicePipe, flashvsr_multi, parse_devices
 
 device_choices = get_device_list()
 
@@ -160,8 +161,9 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, alt_vae="none"):
-    model_path = model_downlod(model_name="JunhaoZhuang/"+model)
+def init_pipeline(model, mode, device, dtype, alt_vae="none", model_path=None):
+    if model_path is None:
+        model_path = model_downlod(model_name="JunhaoZhuang/"+model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
     ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
@@ -385,6 +387,12 @@ class FlashVSRNodeInitPipe:
                     "default": "sparse_sage_attention",
                     "tooltip": '"sparse_sage_attention" is available for sm_75 to sm_120\n"block_sparse_attention" is available for sm_80 to sm_100'
                 }),
+            },
+        "optional": {
+                "devices": ("STRING", {
+                    "default": "",
+                    "tooltip": 'Run tiles in parallel on several devices, e.g. "0,1" or "xpu:0,xpu:1" (indices as visible to ComfyUI).\nEmpty: use the single "device" above.'
+                }),
             }
         }
     
@@ -394,7 +402,20 @@ class FlashVSRNodeInitPipe:
     CATEGORY = "FlashVSR"
     DESCRIPTION = 'Download the entire "FlashVSR" folder with all the files inside it from "https://huggingface.co/JunhaoZhuang/FlashVSR" and put it in the "ComfyUI/models"'
     
-    def main(self, model, mode, alt_vae, force_offload, precision, device, attention_mode):
+    def main(self, model, mode, alt_vae, force_offload, precision, device, attention_mode, devices=""):
+        multi_devices = parse_devices(devices)
+        for dev_type, idx in multi_devices:
+            if f"{dev_type}:{idx}" not in device_choices:
+                raise RuntimeError(f'devices: "{dev_type}:{idx}" not in available devices {device_choices[1:]}')
+        if len(multi_devices) == 1:
+            device = "{}:{}".format(*multi_devices[0])
+        elif len(multi_devices) > 1:
+            # "devices" overrides the device widget: one worker process per listed device
+            cfg = dict(model=model, mode=mode, alt_vae=alt_vae, precision=precision, attention_mode=attention_mode,
+                       model_path=model_downlod(model_name="JunhaoZhuang/"+model),
+                       vae_paths=tuple(folder_paths.get_folder_paths("vae")))
+            return((MultiDevicePipe(multi_devices, cfg), force_offload),)
+
         _device = device
         if device == "auto":
             _device = get_auto_device()
@@ -507,6 +528,9 @@ class FlashVSRNodeAdv:
     
     def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed):
         _pipe, force_offload = pipe
+        if isinstance(_pipe, MultiDevicePipe):
+            output = flashvsr_multi(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload)
+            return(output,)
         output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload)
         return(output,)
 
