@@ -146,6 +146,11 @@ def forward(q, k, k_block_id, v, q_scale, k_scale, is_causal=False, tensor_layou
     num_kv_groups = h_qo // h_kv
 
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b   )
+    # XPU (BMG): 16 warps + IGC-chosen GRF size is ~6.5x faster than the CUDA defaults, same output (see attn_bench)
+    if q.device.type == "xpu":
+        launch = dict(num_warps=16, grf_mode="auto")
+    else:
+        launch = dict(num_warps=4 if head_dim == 64 else 8)
     _attn_fwd[grid](
         q, k, k_block_id, v, q_scale, k_scale, o,  
         stride_bz_q, stride_h_q, stride_seq_q, 
@@ -157,6 +162,6 @@ def forward(q, k, k_block_id, v, q_scale, k_scale, is_causal=False, tensor_layou
         h_qo, num_kv_groups,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
         STAGE=stage,  
-        num_warps=4 if head_dim == 64 else 8,
-        num_stages=4)
+        num_stages=4,
+        **launch)
     return o
