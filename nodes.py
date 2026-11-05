@@ -120,7 +120,6 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     vid_final = vid_stacked.permute(1, 0, 2, 3).unsqueeze(0)
     
     del vid_stacked
-    clean_vram()
     
     return vid_final, tH, tW, F
 
@@ -302,7 +301,8 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-                color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload
+                # weights stay on the device between tiles; offloaded once after the last tile (below)
+                color_fix=color_fix, unload_dit=unload_dit, force_offload=False
             )
             
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
@@ -321,8 +321,10 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
             weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
             
             del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
-            clean_vram()
             
+        if force_offload:
+            pipe.offload_model()
+        clean_vram()
         weight_sum_canvas[weight_sum_canvas == 0] = 1.0
         final_output = final_output_canvas / weight_sum_canvas
     else:
