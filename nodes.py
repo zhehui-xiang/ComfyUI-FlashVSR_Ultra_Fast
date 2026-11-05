@@ -66,7 +66,8 @@ def model_downlod(model_name="JunhaoZhuang/FlashVSR"):
 def tensor2video(frames: torch.Tensor):
     video_squeezed = frames.squeeze(0)
     video_permuted = rearrange(video_squeezed, "C F H W -> F H W C")
-    video_final = (video_permuted.float() + 1.0) / 2.0
+    # contiguous on the device: the permuted view made every CPU consumer slow (np.save 3.3s -> 0.24s per 512x512x125 tile)
+    video_final = ((video_permuted.float() + 1.0) / 2.0).contiguous()
     return video_final
 
 def largest_8n1_leq(n):  # 8n+1
